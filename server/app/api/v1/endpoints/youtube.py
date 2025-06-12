@@ -199,6 +199,7 @@ async def get_available_subtitle_languages(video_id: str):
                 "available_languages": languages["languages"],
                 "total_languages": len(languages["languages"])
             }
+        return None
 
     except HTTPException:
         raise
