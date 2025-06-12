@@ -7,13 +7,13 @@ from dataclasses import dataclass
 import requests
 from youtube_transcript_api import YouTubeTranscriptApi
 from youtube_transcript_api._errors import TranscriptsDisabled, NoTranscriptFound, VideoUnavailable
-
+from embedding_service import EmbeddingService
+from aiolimiter import AsyncLimiter
 logger = logging.getLogger(__name__)
 
 
 @dataclass
 class VideoFormat:
-    """Represents a video format with quality and URL information"""
     itag: int
     mime_type: str
     quality: str
@@ -27,7 +27,6 @@ class VideoFormat:
 
 @dataclass
 class CaptionTrack:
-    """Represents a caption track with language information"""
     language_code: str
     language_name: str
     is_auto_generated: bool
@@ -51,29 +50,41 @@ class VideoInfo:
     category: Optional[str]
 
 
+@dataclass
+class CaptionSegment:
+    """Represents a caption segment with timing and embedding"""
+    text: str
+    start_time: float
+    end_time: float
+    duration: float
+    embedding: List[float]
+    formatted_start: str
+    formatted_end: str
+
+
+@dataclass
+class ProcessedVideo:
+    video_info: VideoInfo
+    captions_text: str
+    captions_vtt: str
+    caption_segments: List[CaptionSegment]
+    metadata_embedding: List[float]
+    full_text_embedding: List[float]
+
+
 class YouTubeVideoService:
-    """Enhanced service for YouTube video information and subtitle extraction"""
 
     def __init__(self):
         self.session = requests.Session()
-        # Updated user agent for better compatibility
-        self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.5',
-            'Accept-Encoding': 'gzip, deflate',
-            'Connection': 'keep-alive',
-        })
-
-        # Common language codes for better multilingual support
+        self.limiter = AsyncLimiter(max_rate=2, time_period=1)
+        self.embedding_service = EmbeddingService()
         self.common_languages = [
             'en', 'es', 'fr', 'de', 'it', 'pt', 'ru', 'ja', 'ko', 'zh', 'zh-CN', 'zh-TW',
-            'ar', 'hi','hi-IN', 'th', 'vi', 'id', 'ms', 'tl', 'sv', 'no', 'da', 'fi', 'nl', 'pl',
+            'ar', 'hi', 'hi-IN', 'th', 'vi', 'id', 'ms', 'tl', 'sv', 'no', 'da', 'fi', 'nl', 'pl',
             'tr', 'cs', 'hu', 'ro', 'bg', 'hr', 'sk', 'sl', 'et', 'lv', 'lt', 'uk', 'he'
         ]
 
     def extract_video_id(self, url: str) -> Optional[str]:
-        """Extract video ID from various YouTube URL formats"""
         patterns = [
             r'(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/)([^&\n?#]+)',
             r'youtube\.com\/v\/([^&\n?#]+)',
@@ -89,10 +100,9 @@ class YouTubeVideoService:
         return None
 
     async def get_video_metadata(self, video_id: str) -> Dict:
-        """Get comprehensive video metadata using multiple APIs"""
+
         metadata = {}
 
-        # Try oEmbed API first (most reliable)
         try:
             oembed_url = f"https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v={video_id}&format=json"
             response = self.session.get(oembed_url, timeout=15)
@@ -239,22 +249,12 @@ class YouTubeVideoService:
             format_type: str = "json",
             translate_to: Optional[str] = None
     ) -> Dict[str, any]:
-        """
-        Get video captions with enhanced multilingual support
 
-        Args:
-            url: YouTube video URL
-            languages: List of preferred language codes (e.g., ['en', 'es', 'fr'])
-            prefer_manual: Whether to prefer manually created over auto-generated
-            format_type: Output format ('json', 'txt', 'srt', 'vtt')
-            translate_to: Language code to translate captions to
-        """
         try:
             video_id = self.extract_video_id(url)
             if not video_id:
                 return {"success": False, "error": "Invalid YouTube URL"}
 
-            # Get available transcripts
             try:
                 transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
             except (TranscriptsDisabled, VideoUnavailable):
@@ -268,19 +268,16 @@ class YouTubeVideoService:
                     "error": "No captions found for this video"
                 }
 
-            # Determine target languages
             if not languages:
-                languages = ['en']  # Default to English
-
-            # Find the best available transcript
+                languages = ['en']
             selected_transcript = None
             selected_language = None
 
-            # Strategy 1: Try to find exact language matches
+
             for lang in languages:
                 try:
                     if prefer_manual:
-                        # Try manual first, then auto-generated
+
                         try:
                             selected_transcript = transcript_list.find_manually_created_transcript([lang])
                             selected_language = lang
@@ -293,18 +290,18 @@ class YouTubeVideoService:
                             except NoTranscriptFound:
                                 continue
                     else:
-                        # Try any transcript in this language
+
                         selected_transcript = transcript_list.find_transcript([lang])
                         selected_language = lang
                         break
                 except NoTranscriptFound:
                     continue
 
-            # Strategy 2: If no exact match, try to find any available transcript
+
             if not selected_transcript:
                 available_transcripts = list(transcript_list)
                 if available_transcripts:
-                    # Prefer manual over auto-generated if we have a choice
+
                     manual_transcripts = [t for t in available_transcripts if not t.is_generated]
                     if manual_transcripts and prefer_manual:
                         selected_transcript = manual_transcripts[0]
@@ -318,16 +315,15 @@ class YouTubeVideoService:
                     "error": "No suitable captions found for the requested languages"
                 }
 
-            # Apply translation if requested
             if translate_to and translate_to != selected_language:
                 try:
                     selected_transcript = selected_transcript.translate(translate_to)
                     selected_language = translate_to
                 except Exception as e:
                     logger.warning(f"Translation to {translate_to} failed: {e}")
-                    # Continue with original language
 
-            # Fetch transcript data
+
+
             try:
                 transcript_data = selected_transcript.fetch()
             except Exception as e:
@@ -336,7 +332,7 @@ class YouTubeVideoService:
                     "error": f"Failed to fetch caption data: {str(e)}"
                 }
 
-            # Process and format transcript data
+
             formatted_captions = []
             for item in transcript_data:
                 caption_dict = {
@@ -348,7 +344,7 @@ class YouTubeVideoService:
                 }
                 formatted_captions.append(caption_dict)
 
-            # Format output
+
             formatted_text = None
             if format_type != "json":
                 formatted_text = self._format_captions(formatted_captions, format_type)
@@ -375,6 +371,199 @@ class YouTubeVideoService:
                 "success": False,
                 "error": str(e)
             }
+
+    async def process_video_with_embeddings(
+            self,
+            url: str,
+            languages: Optional[List[str]] = None,
+            embed_individual_segments: bool = True
+    ) -> ProcessedVideo:
+        try:
+            video_info = await self.get_video_info(url)
+
+            # Fetch all caption formats in parallel
+            captions_result, vtt_result, txt_result = await asyncio.gather(
+                self.get_captions(url, languages=languages, format_type="json"),
+                self.get_captions(url, languages=languages, format_type="vtt"),
+                self.get_captions(url, languages=languages, format_type="txt")
+            )
+
+            if not captions_result["success"]:
+                raise ValueError(f"Failed to get captions: {captions_result['error']}")
+
+            captions_text = txt_result.get("text", "") if txt_result["success"] else ""
+            captions_vtt = vtt_result.get("text", "") if vtt_result["success"] else ""
+            subtitle_segments = captions_result.get("subtitles", [])
+
+            metadata_text = self._create_metadata_text(video_info)
+            caption_segments = []
+
+            if embed_individual_segments and subtitle_segments:
+                print(f"Generating embeddings for {len(subtitle_segments)} caption segments...")
+
+                async def process_segment(segment):
+                    text = segment.get("text", "").strip()
+                    if not text:
+                        return None
+                    try:
+                        start_time = segment.get("start", 0.0)
+                        duration = segment.get("duration", 0.0)
+                        end_time = start_time + duration
+
+                        async with self.semaphore:  # Limit concurrency
+                            embedding = await asyncio.to_thread(
+                                self.embedding_service.get_document_embedding, text
+                            )
+
+                        return CaptionSegment(
+                            text=text,
+                            start_time=start_time,
+                            end_time=end_time,
+                            duration=duration,
+                            embedding=embedding,
+                            formatted_start=self._seconds_to_vtt_time(start_time),
+                            formatted_end=self._seconds_to_vtt_time(end_time)
+                        )
+                    except Exception as e:
+                        logger.warning(f"Failed to embed segment '{text[:50]}...': {e}")
+                        return None
+
+                # Run segment processing with controlled concurrency
+                caption_segments = await asyncio.gather(
+                    *[process_segment(seg) for seg in subtitle_segments]
+                )
+                caption_segments = [seg for seg in caption_segments if seg is not None]
+
+            print("Generating embedding for full caption text...")
+            full_text_embedding = []
+            if captions_text:
+                try:
+                    async with self.semaphore:
+                        full_text_embedding = await asyncio.to_thread(
+                            self.embedding_service.get_document_embedding, captions_text
+                        )
+                except Exception as e:
+                    logger.warning(f"Failed to generate full text embedding: {e}")
+
+            print("Generating embeddings for metadata...")
+            metadata_embedding = []
+            try:
+                async with self.semaphore:
+                    metadata_embedding = await asyncio.to_thread(
+                        self.embedding_service.get_document_embedding, metadata_text
+                    )
+            except Exception as e:
+                logger.warning(f"Failed to generate metadata embedding: {e}")
+
+            return ProcessedVideo(
+                video_info=video_info,
+                captions_text=captions_text,
+                captions_vtt=captions_vtt,
+                caption_segments=caption_segments,
+                metadata_embedding=metadata_embedding,
+                full_text_embedding=full_text_embedding
+            )
+
+        except Exception as e:
+            logger.error(f"Error processing video with embeddings: {e}")
+            rais
+    def _create_metadata_text(self, video_info: VideoInfo) -> str:
+
+        metadata_parts = [
+            f"Title: {video_info.title}",
+            f"Author: {video_info.author}",
+            f"Description: {video_info.description}" if video_info.description else "",
+            f"Duration: {video_info.duration} seconds" if video_info.duration else "",
+            f"View count: {video_info.view_count}" if video_info.view_count else "",
+            f"Publish date: {video_info.publish_date}" if video_info.publish_date else "",
+            f"Tags: {', '.join(video_info.tags)}" if video_info.tags else "",
+            f"Category: {video_info.category}" if video_info.category else ""
+        ]
+
+        return " | ".join([part for part in metadata_parts if part])
+
+    def display_embeddings_with_timestamps(self, processed_video: ProcessedVideo, max_segments: int = 10):
+
+        print(f"\n🕒 TIMESTAMPED EMBEDDINGS")
+        print("=" * 80)
+
+        if not processed_video.caption_segments:
+            print("No caption segments with embeddings available.")
+            return
+
+        segments_to_show = min(max_segments, len(processed_video.caption_segments))
+
+        for i, segment in enumerate(processed_video.caption_segments[:segments_to_show]):
+            print(f"\n📍 Segment {i + 1}:")
+            print(f"   ⏰ Time: {segment.formatted_start} --> {segment.formatted_end}")
+            print(f"   ⏱️  Duration: {segment.duration:.2f}s")
+            print(f"   📝 Text: \"{segment.text[:100]}{'...' if len(segment.text) > 100 else ''}\"")
+            print(
+                f"   🧠 Embedding: [{segment.embedding[0]:.6f}, {segment.embedding[1]:.6f}, {segment.embedding[2]:.6f}, ..., {segment.embedding[-1]:.6f}]")
+            print(f"   📊 Dimensions: {len(segment.embedding)}")
+            print("-" * 60)
+
+        if len(processed_video.caption_segments) > max_segments:
+            remaining = len(processed_video.caption_segments) - max_segments
+            print(f"\n... and {remaining} more segments")
+
+        print(f"\n📈 SUMMARY:")
+        print(f"   Total segments: {len(processed_video.caption_segments)}")
+        print(
+            f"   Embedding dimensions: {len(processed_video.caption_segments[0].embedding) if processed_video.caption_segments else 0}")
+
+        if processed_video.full_text_embedding:
+            print(f"   Full text embedding dimensions: {len(processed_video.full_text_embedding)}")
+
+        if processed_video.metadata_embedding:
+            print(f"   Metadata embedding dimensions: {len(processed_video.metadata_embedding)}")
+
+
+
+    def export_embeddings_json(self, processed_video: ProcessedVideo, filename: str = None) -> str:
+
+        if not filename:
+            filename = f"{processed_video.video_info.video_id}_embeddings.json"
+
+        export_data = {
+            "video_info": {
+                "video_id": processed_video.video_info.video_id,
+                "title": processed_video.video_info.title,
+                "author": processed_video.video_info.author,
+                "duration": processed_video.video_info.duration,
+                "view_count": processed_video.video_info.view_count,
+                "publish_date": processed_video.video_info.publish_date
+            },
+            "caption_segments": [
+                {
+                    "text": segment.text,
+                    "start_time": segment.start_time,
+                    "end_time": segment.end_time,
+                    "duration": segment.duration,
+                    "formatted_start": segment.formatted_start,
+                    "formatted_end": segment.formatted_end,
+                    "embedding": segment.embedding
+                }
+                for segment in processed_video.caption_segments
+            ],
+            "metadata_embedding": processed_video.metadata_embedding,
+            "full_text_embedding": processed_video.full_text_embedding,
+            "total_segments": len(processed_video.caption_segments),
+            "embedding_dimensions": len(
+                processed_video.caption_segments[0].embedding) if processed_video.caption_segments else 0
+        }
+
+        json_str = json.dumps(export_data, indent=2, ensure_ascii=False)
+
+        # Optionally save to file
+        try:
+            with open(filename, 'w', encoding='utf-8') as f:
+                f.write(json_str)
+            print(f"✅ Embeddings exported to {filename}")
+        except Exception as e:
+            logger.warning(f"Could not save to file {filename}: {e}")
+
+        return json_str
 
     async def get_all_available_captions(self, url: str) -> Dict[str, any]:
         """Get information about all available caption tracks"""
@@ -415,17 +604,9 @@ class YouTubeVideoService:
         else:
             return ""
 
-    def _format_as_srt(self, captions: List[Dict]) -> str:
-        """Format captions as SRT"""
-        srt_content = []
-        for i, caption in enumerate(captions, 1):
-            start = self._seconds_to_srt_time(caption.get("start", 0))
-            end = self._seconds_to_srt_time(caption.get("start", 0) + caption.get("duration", 0))
-            srt_content.append(f"{i}\n{start} --> {end}\n{caption.get('text', '')}\n")
-        return "\n".join(srt_content)
 
     def _format_as_vtt(self, captions: List[Dict]) -> str:
-        """Format captions as WebVTT"""
+        """Format captions as VTT"""
         vtt_content = ["WEBVTT\n"]
         for caption in captions:
             start = self._seconds_to_vtt_time(caption.get("start", 0))
@@ -433,13 +614,6 @@ class YouTubeVideoService:
             vtt_content.append(f"{start} --> {end}\n{caption.get('text', '')}\n")
         return "\n".join(vtt_content)
 
-    def _seconds_to_srt_time(self, seconds: float) -> str:
-        """Convert seconds to SRT time format (HH:MM:SS,mmm)"""
-        hours = int(seconds // 3600)
-        minutes = int((seconds % 3600) // 60)
-        secs = seconds % 60
-        millis = int((secs - int(secs)) * 1000)
-        return f"{hours:02d}:{minutes:02d}:{int(secs):02d},{millis:03d}"
 
     def _seconds_to_vtt_time(self, seconds: float) -> str:
         """Convert seconds to VTT time format (HH:MM:SS.mmm)"""
@@ -450,11 +624,8 @@ class YouTubeVideoService:
 
 
 async def main():
-    """Example usage of the Enhanced YouTube Video Service"""
-    # Test URLs with different caption scenarios
     test_urls = [
-        "https://www.youtube.com/watch?v=dQw4w9WgXcQ",  # Rick Roll - usually has captions
-        "https://www.youtube.com/watch?v=5qo4-D4Mn3E",  # Me at the zoo - first YouTube video
+        "https://www.youtube.com/watch?v=GzrULKF4jk8"
     ]
 
     service = YouTubeVideoService()
@@ -465,79 +636,31 @@ async def main():
         print('=' * 60)
 
         try:
-            # Get video information
-            print("\n1. Getting video information...")
-            video_info = await service.get_video_info(url)
-            print(f"   Title: {video_info.title}")
-            print(f"   Author: {video_info.author}")
-            print(f"   Duration: {video_info.duration}s" if video_info.duration else "   Duration: Unknown")
-            print(f"   View Count: {video_info.view_count:,}" if video_info.view_count else "   View Count: Unknown")
-            print(f"   Available Caption Tracks: {len(video_info.available_captions)}")
 
-            # List available captions
-            print("\n2. Available caption languages:")
-            if video_info.available_captions:
-                for track in video_info.available_captions:
-                    status = "Auto-generated" if track.is_auto_generated else "Manual"
-                    translatable = "Translatable" if track.is_translatable else "Not translatable"
-                    print(f"   - {track.language_code} ({track.language_name}) - {status}, {translatable}")
-            else:
-                print("   No captions available")
+            processed_video = await service.process_video_with_embeddings(url, languages=['en'])
 
-            # Try to get captions in multiple languages
-            print("\n3. Testing caption retrieval...")
+            print(f"\n📹 Video Info:")
+            print(f"   Title: {processed_video.video_info.title}")
+            print(f"   Author: {processed_video.video_info.author}")
+            print(f"   Duration: {processed_video.video_info.duration} seconds")
+            print(f"   View Count: {processed_video.video_info.view_count}")
 
-            # Test 1: English captions
-            captions = await service.get_captions(url, languages=['en'])
-            if captions["success"]:
-                print(f"   ✓ English captions found ({captions['total_segments']} segments)")
-                print(f"     Language: {captions['language']} ({captions['language_name']})")
-                print(f"     Auto-generated: {captions['is_auto_generated']}")
+            print(f"\n📝 Captions Info:")
+            print(f"   Full Text Length: {len(processed_video.captions_text)} characters")
+            print(f"   VTT Length: {len(processed_video.captions_vtt)} characters")
+            print(f"   Individual Segments: {len(processed_video.caption_segments)}")
 
-                # Show ALL captions (full length)
-                if captions["subtitles"]:
-                    print("\n     FULL CAPTIONS:")
-                    print("     " + "="*50)
-                    for i, sub in enumerate(captions["subtitles"], 1):
-                        timestamp = f"[{sub['start']:.1f}s - {sub['start'] + sub['duration']:.1f}s]"
-                        print(f"     {i:3d}. {timestamp:20} {sub['text']}")
-                    print("     " + "="*50)
-            else:
-                print(f"   ✗ English captions failed: {captions['error']}")
 
-            # Test 2: Multiple language preference
-            captions_multi = await service.get_captions(url, languages=['es', 'fr', 'en'])
-            if captions_multi["success"]:
-                print(f"   ✓ Multi-language search found: {captions_multi['language']}")
-            else:
-                print(f"   ✗ Multi-language search failed: {captions_multi['error']}")
+            service.display_embeddings_with_timestamps(processed_video, max_segments=5)
+            print(f"\n💾 EXPORT DEMO:")
+            print("=" * 30)
+            json_data = service.export_embeddings_json(processed_video)
+            print(f"JSON export length: {len(json_data)} characters")
 
-            # Test 3: Translation (if captions exist)
-            if captions["success"]:
-                translated = await service.get_captions(url, languages=['en'], translate_to='es')
-                if translated["success"]:
-                    print(f"   ✓ Translation to Spanish successful")
-                    print(f"     Was translated: {translated['was_translated']}")
-                else:
-                    print(f"   ✗ Translation failed: {translated['error']}")
-
-            # Test 4: Different formats
-            if captions["success"]:
-                print("\n4. Testing different formats...")
-                for fmt in ['txt', 'srt', 'vtt']:
-                    formatted = await service.get_captions(url, languages=['en'], format_type=fmt)
-                    if formatted["success"]:
-                        print(f"   ✓ {fmt.upper()} format: {len(formatted['text'])} chars")
-                        print(f"     FULL {fmt.upper()} OUTPUT:")
-                        print("     " + "-"*40)
-                        # Print the full formatted text
-                        lines = formatted["text"].split('\n')
-                        for line in lines:
-                            print(f"     {line}")
-                        print("     " + "-"*40)
+            print(f"\n✅ Successfully processed video with timestamped embeddings!")
 
         except Exception as e:
-            print(f"Error processing {url}: {e}")
+            print(f"❌ Error processing {url}: {e}")
 
     print(f"\n{'=' * 60}")
     print("Testing complete!")
