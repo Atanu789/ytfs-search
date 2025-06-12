@@ -2,22 +2,18 @@ import asyncio
 import logging
 import re
 import json
-import os
-import tempfile
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
 import requests
 from youtube_transcript_api import YouTubeTranscriptApi
 from youtube_transcript_api._errors import TranscriptsDisabled, NoTranscriptFound, VideoUnavailable
-import assemblyai as aai
-import yt_dlp
-from typing import Dict, Any
+
 logger = logging.getLogger(__name__)
 
 
 @dataclass
 class VideoFormat:
-  
+    """Represents a video format with quality and URL information"""
     itag: int
     mime_type: str
     quality: str
@@ -31,7 +27,7 @@ class VideoFormat:
 
 @dataclass
 class CaptionTrack:
-   
+    """Represents a caption track with language information"""
     language_code: str
     language_name: str
     is_auto_generated: bool
@@ -40,7 +36,7 @@ class CaptionTrack:
 
 @dataclass
 class VideoInfo:
-   
+    """Contains comprehensive video information"""
     video_id: str
     title: str
     description: str
@@ -55,177 +51,12 @@ class VideoInfo:
     category: Optional[str]
 
 
-@dataclass
-class TranscriptionResult:
-  
-    success: bool
-    text: Optional[str]
-    segments: Optional[List[Dict]]
-    source: str 
-    language: Optional[str]
-    confidence: Optional[float]
-    duration: Optional[float]
-    error: Optional[str] = None
-
-
-class AssemblyAIService:
-    
-
-    def __init__(self, api_key: str):
-       
-        if not api_key:
-            raise ValueError("AssemblyAI API key is required")
-
-        aai.settings.api_key = api_key
-        self.transcriber = aai.Transcriber()
-
-    async def transcribe_audio_url(self, audio_url: str,
-                                   config: Optional[aai.TranscriptionConfig] = None) -> TranscriptionResult:
-      
-        try:
-            if not config:
-                config = aai.TranscriptionConfig(
-                    speech_model=aai.SpeechModel.best,
-                    language_detection=True,
-                    punctuate=True,
-                    format_text=True
-                )
-
-            transcript = await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: self.transcriber.transcribe(audio_url, config=config)
-            )
-
-            if transcript.status == aai.TranscriptStatus.error:
-                return TranscriptionResult(
-                    success=False,
-                    text=None,
-                    segments=None,
-                    source="assemblyai",
-                    language=None,
-                    confidence=None,
-                    duration=None,
-                    error=f"AssemblyAI transcription failed: {transcript.error}"
-                )
-
-            segments = []
-            if hasattr(transcript, 'words') and transcript.words:
-                current_segment = {"text": "", "start": 0, "end": 0}
-                segment_words = []
-
-                for word in transcript.words:
-                    if not segment_words:
-                        current_segment["start"] = word.start / 1000.0  
-
-                    segment_words.append(word.text)
-                    current_segment["end"] = word.end / 1000.0
-
-                    if len(segment_words) >= 8:
-                        current_segment["text"] = " ".join(segment_words)
-                        current_segment["duration"] = current_segment["end"] - current_segment["start"]
-                        segments.append(current_segment.copy())
-
-                        segment_words = []
-                        current_segment = {"text": "", "start": 0, "end": 0}
-
-                if segment_words:
-                    current_segment["text"] = " ".join(segment_words)
-                    current_segment["duration"] = current_segment["end"] - current_segment["start"]
-                    segments.append(current_segment)
-
-            return TranscriptionResult(
-                success=True,
-                text=transcript.text,
-                segments=segments if segments else None,
-                source="assemblyai",
-                language=getattr(transcript, 'language_code', None),
-                confidence=getattr(transcript, 'confidence', None),
-                duration=getattr(transcript, 'audio_duration', None),
-                error=None
-            )
-
-        except Exception as e:
-            logger.error(f"AssemblyAI transcription error: {e}")
-            return TranscriptionResult(
-                success=False,
-                text=None,
-                segments=None,
-                source="assemblyai",
-                language=None,
-                confidence=None,
-                duration=None,
-                error=str(e)
-            )
-
-
-class YouTubeAudioExtractor:
- 
+class YouTubeVideoService:
+    """Enhanced service for YouTube video information and subtitle extraction"""
 
     def __init__(self):
-        self.ydl_opts = {
-            'format': 'bestaudio/best',
-            'extractaudio': True,
-            'audioformat': 'mp3',
-            'outtmpl': '%(title)s.%(ext)s',
-            'quiet': True,
-            'no_warnings': True,
-            # Add retry parameters
-            'retries': 3,
-            'fragment_retries': 3,
-            'skip_unavailable_fragments': True,
-            'extractor_args': {
-                'youtube': {
-                    'skip': ['dash', 'hls']
-                }
-            }
-        }
-
-    async def extract_audio_url(self, video_url: str) -> Optional[str]:
-      
-        try:
-      
-            def extract_info():
-                with yt_dlp.YoutubeDL(self.ydl_opts) as ydl:
-                    try:
-                        info = ydl.extract_info(video_url, download=False)
-                        if not info:
-                            return None
-
-                        audio_formats = [f for f in info.get('formats', [])
-                                     if f.get('acodec') != 'none' and f.get('vcodec') == 'none']
-
-                        if not audio_formats:
-                            audio_formats = [f for f in info.get('formats', [])
-                                         if f.get('acodec') != 'none']
-
-                        if audio_formats:
-                            def get_bitrate(fmt):
-                                abr = fmt.get('abr')
-                                tbr = fmt.get('tbr')
-                                return abr if isinstance(abr, (int, float)) else (
-                                    tbr if isinstance(tbr, (int, float)) else 0)
-
-                            best_audio = max(audio_formats, key=get_bitrate)
-                            return best_audio.get('url')
-
-                        return None
-                    except yt_dlp.DownloadError as e:
-                        logger.error(f"Download error: {e}")
-                        return None
-                return None
-
-            audio_url = await asyncio.get_event_loop().run_in_executor(None, extract_info)
-            return audio_url
-
-        except Exception as e:
-            logger.error(f"Failed to extract audio URL: {e}")
-            return None
-
-class YouTubeVideoService:
-   
-    def __init__(self, assemblyai_api_key: Optional[str] = None):
         self.session = requests.Session()
-       
+        # Updated user agent for better compatibility
         self.session.headers.update({
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
@@ -234,25 +65,15 @@ class YouTubeVideoService:
             'Connection': 'keep-alive',
         })
 
+        # Common language codes for better multilingual support
         self.common_languages = [
             'en', 'es', 'fr', 'de', 'it', 'pt', 'ru', 'ja', 'ko', 'zh', 'zh-CN', 'zh-TW',
-            'ar', 'hi', 'hi-IN', 'th', 'vi', 'id', 'ms', 'tl', 'sv', 'no', 'da', 'fi', 'nl', 'pl',
+            'ar', 'hi','hi-IN', 'th', 'vi', 'id', 'ms', 'tl', 'sv', 'no', 'da', 'fi', 'nl', 'pl',
             'tr', 'cs', 'hu', 'ro', 'bg', 'hr', 'sk', 'sl', 'et', 'lv', 'lt', 'uk', 'he'
         ]
 
-        self.assemblyai_service = None
-        self.audio_extractor = None
-
-        if assemblyai_api_key:
-            try:
-                self.assemblyai_service = AssemblyAIService(assemblyai_api_key)
-                self.audio_extractor = YouTubeAudioExtractor()
-                logger.info("AssemblyAI fallback enabled")
-            except Exception as e:
-                logger.warning(f"Failed to initialize AssemblyAI service: {e}")
-
     def extract_video_id(self, url: str) -> Optional[str]:
-       
+        """Extract video ID from various YouTube URL formats"""
         patterns = [
             r'(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/)([^&\n?#]+)',
             r'youtube\.com\/v\/([^&\n?#]+)',
@@ -271,7 +92,7 @@ class YouTubeVideoService:
         """Get comprehensive video metadata using multiple APIs"""
         metadata = {}
 
-      
+        # Try oEmbed API first (most reliable)
         try:
             oembed_url = f"https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v={video_id}&format=json"
             response = self.session.get(oembed_url, timeout=15)
@@ -286,38 +107,41 @@ class YouTubeVideoService:
         except Exception as e:
             logger.warning(f"oEmbed API failed: {e}")
 
+        # Try YouTube's internal API for additional details
         try:
-   
+            # This endpoint sometimes provides more detailed information
             watch_url = f"https://www.youtube.com/watch?v={video_id}"
             response = self.session.get(watch_url, timeout=15)
 
             if response.status_code == 200:
                 html_content = response.text
 
-                
+                # Extract additional metadata from HTML using regex
                 title_match = re.search(r'"title":"([^"]+)"', html_content)
                 if title_match and 'title' not in metadata:
                     metadata['title'] = title_match.group(1).encode().decode('unicode_escape')
 
+                # Extract view count
                 view_match = re.search(r'"viewCount":"(\d+)"', html_content)
                 if view_match:
                     metadata['view_count'] = int(view_match.group(1))
 
-               
+                # Extract duration
                 duration_match = re.search(r'"lengthSeconds":"(\d+)"', html_content)
                 if duration_match:
                     metadata['duration'] = int(duration_match.group(1))
 
+                # Extract description
                 desc_match = re.search(r'"shortDescription":"([^"]*)"', html_content)
                 if desc_match:
                     metadata['description'] = desc_match.group(1).encode().decode('unicode_escape')
 
-               
+                # Extract upload date
                 date_match = re.search(r'"uploadDate":"([^"]+)"', html_content)
                 if date_match:
                     metadata['publish_date'] = date_match.group(1)
 
-                
+                # Extract tags
                 tags_match = re.search(r'"keywords":\[([^\]]+)\]', html_content)
                 if tags_match:
                     try:
@@ -329,6 +153,7 @@ class YouTubeVideoService:
         except Exception as e:
             logger.warning(f"Failed to extract additional metadata: {e}")
 
+        # Fill in defaults for missing fields
         metadata.setdefault('title', f'Video {video_id}')
         metadata.setdefault('author', 'Unknown Author')
         metadata.setdefault('description', '')
@@ -370,6 +195,7 @@ class YouTubeVideoService:
             if not video_id:
                 raise ValueError("Invalid YouTube URL")
 
+            # Get metadata and available captions concurrently
             metadata_task = self.get_video_metadata(video_id)
             captions_task = self.get_available_captions(video_id)
 
@@ -377,6 +203,7 @@ class YouTubeVideoService:
                 metadata_task, captions_task, return_exceptions=True
             )
 
+            # Handle exceptions from concurrent tasks
             if isinstance(metadata, Exception):
                 logger.error(f"Failed to get metadata: {metadata}")
                 metadata = {'title': f'Video {video_id}', 'author': 'Unknown'}
@@ -394,7 +221,7 @@ class YouTubeVideoService:
                 author=metadata['author'],
                 publish_date=metadata['publish_date'],
                 thumbnail_url=metadata['thumbnail_url'],
-                formats=[],  
+                formats=[],  # We're removing pytube, so no download formats
                 available_captions=available_captions,
                 tags=metadata['tags'],
                 category=metadata['category']
@@ -410,67 +237,24 @@ class YouTubeVideoService:
             languages: Optional[List[str]] = None,
             prefer_manual: bool = True,
             format_type: str = "json",
-            translate_to: Optional[str] = None,
-            use_assemblyai_fallback: bool = True
+            translate_to: Optional[str] = None
     ) -> Dict[str, any]:
-       
+        """
+        Get video captions with enhanced multilingual support
+
+        Args:
+            url: YouTube video URL
+            languages: List of preferred language codes (e.g., ['en', 'es', 'fr'])
+            prefer_manual: Whether to prefer manually created over auto-generated
+            format_type: Output format ('json', 'txt', 'srt', 'vtt')
+            translate_to: Language code to translate captions to
+        """
         try:
             video_id = self.extract_video_id(url)
             if not video_id:
                 return {"success": False, "error": "Invalid YouTube URL"}
 
-         
-            youtube_result = await self._get_youtube_captions(
-                video_id, languages, prefer_manual, format_type, translate_to
-            )
-
-            if youtube_result["success"]:
-                youtube_result["transcription_source"] = "youtube_captions"
-                return youtube_result
-
-            if use_assemblyai_fallback and self.assemblyai_service and self.audio_extractor:
-                logger.info("YouTube captions failed, trying AssemblyAI fallback...")
-
-                assemblyai_result = await self._get_assemblyai_transcription(
-                    url, format_type
-                )
-
-                if assemblyai_result["success"]:
-                    assemblyai_result["transcription_source"] = "assemblyai"
-                    assemblyai_result["fallback_reason"] = youtube_result["error"]
-                    return assemblyai_result
-                else:
-                   
-                    return {
-                        "success": False,
-                        "error": f"YouTube captions failed: {youtube_result['error']}. AssemblyAI fallback also failed: {assemblyai_result['error']}",
-                        "youtube_error": youtube_result["error"],
-                        "assemblyai_error": assemblyai_result["error"]
-                    }
-            else:
-            
-                if not self.assemblyai_service:
-                    youtube_result["note"] = "AssemblyAI fallback not available (no API key provided)"
-                return youtube_result
-
-        except Exception as e:
-            logger.error(f"Error getting captions: {e}")
-            return {
-                "success": False,
-                "error": str(e)
-            }
-
-    async def _get_youtube_captions(
-            self,
-            video_id: str,
-            languages: Optional[List[str]],
-            prefer_manual: bool,
-            format_type: str,
-            translate_to: Optional[str]
-    ) -> Dict[str, any]:
-        """Get captions from YouTube's native caption system"""
-        try:
-           
+            # Get available transcripts
             try:
                 transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
             except (TranscriptsDisabled, VideoUnavailable):
@@ -484,16 +268,19 @@ class YouTubeVideoService:
                     "error": "No captions found for this video"
                 }
 
+            # Determine target languages
             if not languages:
-                languages = ['en']  
+                languages = ['en']  # Default to English
 
+            # Find the best available transcript
             selected_transcript = None
             selected_language = None
 
+            # Strategy 1: Try to find exact language matches
             for lang in languages:
                 try:
                     if prefer_manual:
-                  
+                        # Try manual first, then auto-generated
                         try:
                             selected_transcript = transcript_list.find_manually_created_transcript([lang])
                             selected_language = lang
@@ -506,18 +293,18 @@ class YouTubeVideoService:
                             except NoTranscriptFound:
                                 continue
                     else:
-                       
+                        # Try any transcript in this language
                         selected_transcript = transcript_list.find_transcript([lang])
                         selected_language = lang
                         break
                 except NoTranscriptFound:
                     continue
 
-           
+            # Strategy 2: If no exact match, try to find any available transcript
             if not selected_transcript:
                 available_transcripts = list(transcript_list)
                 if available_transcripts:
-  
+                    # Prefer manual over auto-generated if we have a choice
                     manual_transcripts = [t for t in available_transcripts if not t.is_generated]
                     if manual_transcripts and prefer_manual:
                         selected_transcript = manual_transcripts[0]
@@ -531,14 +318,16 @@ class YouTubeVideoService:
                     "error": "No suitable captions found for the requested languages"
                 }
 
-            
+            # Apply translation if requested
             if translate_to and translate_to != selected_language:
                 try:
                     selected_transcript = selected_transcript.translate(translate_to)
                     selected_language = translate_to
                 except Exception as e:
                     logger.warning(f"Translation to {translate_to} failed: {e}")
-                   
+                    # Continue with original language
+
+            # Fetch transcript data
             try:
                 transcript_data = selected_transcript.fetch()
             except Exception as e:
@@ -547,7 +336,7 @@ class YouTubeVideoService:
                     "error": f"Failed to fetch caption data: {str(e)}"
                 }
 
-        
+            # Process and format transcript data
             formatted_captions = []
             for item in transcript_data:
                 caption_dict = {
@@ -559,6 +348,7 @@ class YouTubeVideoService:
                 }
                 formatted_captions.append(caption_dict)
 
+            # Format output
             formatted_text = None
             if format_type != "json":
                 formatted_text = self._format_captions(formatted_captions, format_type)
@@ -580,132 +370,12 @@ class YouTubeVideoService:
             }
 
         except Exception as e:
-            logger.error(f"Error getting YouTube captions: {e}")
+            logger.error(f"Error getting captions: {e}")
             return {
                 "success": False,
                 "error": str(e)
             }
 
-    async def _get_assemblyai_transcription(self, url: str, format_type: str = "json") -> Dict[str, Any]:
-        """Get transcription using AssemblyAI as fallback with local download"""
-        try:
-            video_id = self.extract_video_id(url)
-            if not video_id:
-                return {"success": False, "error": "Invalid YouTube URL"}
-
-            logger.info("Extracting audio URL...")
-
-           
-            audio_url = await self.audio_extractor.extract_audio_url(url)
-            if not audio_url:
-                return {
-                    "success": False,
-                    "error": "Failed to extract audio URL from video"
-                }
-
-            logger.info("Downloading audio file temporarily...")
-
-            with tempfile.NamedTemporaryFile(suffix='.mp3', delete=False) as tmp_file:
-                temp_path = tmp_file.name
-
-                try:
-                   
-                    response = await asyncio.get_event_loop().run_in_executor(
-                        None,
-                        lambda: requests.get(audio_url, stream=True, timeout=30)
-                    )
-                    response.raise_for_status()
-
-                    for chunk in response.iter_content(chunk_size=8192):
-                        if chunk:
-                            tmp_file.write(chunk)
-
-                    tmp_file.flush()
-
-                    logger.info(f"Audio downloaded to {temp_path} ({os.path.getsize(temp_path) / 1024 / 1024:.2f} MB)")
-
-                    
-                    logger.info("Uploading to AssemblyAI...")
-                    upload_url = await asyncio.get_event_loop().run_in_executor(
-                        None,
-                        lambda: self.assemblyai_service.transcriber.upload_file(temp_path)
-                    )
-
-                    logger.info(f"AssemblyAI upload URL: {upload_url}")
-
-                   
-                    transcription_result = await self.assemblyai_service.transcribe_audio_url(
-                        upload_url,
-                        config=aai.TranscriptionConfig(
-                            speech_model=aai.SpeechModel.best,
-                            language_detection=True
-                        )
-                    )
-
-              
-                    try:
-                        os.unlink(temp_path)
-                    except Exception as e:
-                        logger.warning(f"Failed to delete temp file: {e}")
-
-             
-                    if not transcription_result.success:
-                        return {
-                            "success": False,
-                            "error": transcription_result.error
-                        }
-
-                    formatted_captions = []
-                    if transcription_result.segments:
-                        formatted_captions = [
-                            {
-                                'text': segment['text'],
-                                'start': segment['start'],
-                                'duration': segment.get('duration', segment['end'] - segment['start'])
-                            }
-                            for segment in transcription_result.segments
-                        ]
-                    else:
-                        formatted_captions = [{
-                            'text': transcription_result.text,
-                            'start': 0.0,
-                            'duration': transcription_result.duration or 0.0
-                        }]
-
-                    formatted_text = None
-                    if format_type != "json":
-                        formatted_text = self._format_captions(formatted_captions, format_type)
-
-                    return {
-                        "success": True,
-                        "video_id": video_id,
-                        "language": transcription_result.language or "auto-detected",
-                        "language_name": transcription_result.language or "Auto-detected",
-                        "is_auto_generated": True,
-                        "format_type": format_type,
-                        "total_segments": len(formatted_captions),
-                        "duration": transcription_result.duration,
-                        "confidence": transcription_result.confidence,
-                        "subtitles": formatted_captions if format_type == "json" else None,
-                        "text": formatted_text if format_type != "json" else transcription_result.text,
-                        "was_translated": False,
-                        "transcription_method": "assemblyai"
-                    }
-
-                except Exception as e:
-                    try:
-                        os.unlink(temp_path)
-                    except:
-                        pass
-                    logger.exception("Error during audio download or transcription")
-                    raise e
-
-        except Exception as e:
-            logger.error(f"AssemblyAI transcription error: {e}")
-            return {
-                "success": False,
-                "error": f"AssemblyAI transcription failed: {str(e)}"
-            }
     async def get_all_available_captions(self, url: str) -> Dict[str, any]:
         """Get information about all available caption tracks"""
         try:
@@ -715,7 +385,7 @@ class YouTubeVideoService:
 
             available_captions = await self.get_available_captions(video_id)
 
-            result = {
+            return {
                 "success": True,
                 "video_id": video_id,
                 "available_languages": [
@@ -729,16 +399,6 @@ class YouTubeVideoService:
                 ],
                 "total_tracks": len(available_captions)
             }
-
-        
-            if self.assemblyai_service:
-                result["assemblyai_fallback_available"] = True
-                result["note"] = "AssemblyAI fallback available for videos without captions"
-            else:
-                result["assemblyai_fallback_available"] = False
-                result["note"] = "AssemblyAI fallback not configured"
-
-            return result
 
         except Exception as e:
             logger.error(f"Error getting available captions: {e}")
@@ -790,100 +450,103 @@ class YouTubeVideoService:
 
 
 async def main():
-    """Example usage of the YouTube Video Service"""
-   
-    ASSEMBLYAI_API_KEY = "9b6fce9eb17b4087981066119b25f81b"
+    """Example usage of the Enhanced YouTube Video Service"""
+    # Test URLs with different caption scenarios
+    test_urls = [
+        "https://www.youtube.com/watch?v=dQw4w9WgXcQ",  # Rick Roll - usually has captions
+        "https://www.youtube.com/watch?v=5qo4-D4Mn3E",  # Me at the zoo - first YouTube video
+    ]
 
-  
-    service = YouTubeVideoService(assemblyai_api_key=ASSEMBLYAI_API_KEY)
+    service = YouTubeVideoService()
 
- 
-    video_url = "https://www.youtube.com/watch?v=aW2oassRy64"
+    for url in test_urls:
+        print(f"\n{'=' * 60}")
+        print(f"Testing URL: {url}")
+        print('=' * 60)
 
-    try:
-    
-        print("Getting video information...")
-        video_info = await service.get_video_info(video_url)
-        print(f"Title: {video_info.title}")
-        print(f"Author: {video_info.author}")
-        print(f"Duration: {video_info.duration} seconds")
-        print(f"Available captions: {len(video_info.available_captions)}")
+        try:
+            # Get video information
+            print("\n1. Getting video information...")
+            video_info = await service.get_video_info(url)
+            print(f"   Title: {video_info.title}")
+            print(f"   Author: {video_info.author}")
+            print(f"   Duration: {video_info.duration}s" if video_info.duration else "   Duration: Unknown")
+            print(f"   View Count: {video_info.view_count:,}" if video_info.view_count else "   View Count: Unknown")
+            print(f"   Available Caption Tracks: {len(video_info.available_captions)}")
 
-      
-        print("\nGetting available captions...")
-        available_captions = await service.get_all_available_captions(video_url)
-        if available_captions["success"]:
-            for lang in available_captions["available_languages"]:
-                print(f"- {lang['name']} ({lang['code']}) - Auto: {lang['auto_generated']}")
+            # List available captions
+            print("\n2. Available caption languages:")
+            if video_info.available_captions:
+                for track in video_info.available_captions:
+                    status = "Auto-generated" if track.is_auto_generated else "Manual"
+                    translatable = "Translatable" if track.is_translatable else "Not translatable"
+                    print(f"   - {track.language_code} ({track.language_name}) - {status}, {translatable}")
+            else:
+                print("   No captions available")
 
-        print("\nGetting captions...")
-        captions_result = await service.get_captions(
-            video_url,
-            languages=['en'],
-            format_type='txt',
-            use_assemblyai_fallback=True
-        )
+            # Try to get captions in multiple languages
+            print("\n3. Testing caption retrieval...")
 
-        if captions_result["success"]:
-            print(f"Captions retrieved successfully!")
-            print(f"Language: {captions_result['language']}")
-            print(f"Source: {captions_result.get('transcription_source', 'youtube_captions')}")
-            print(f"Total segments: {captions_result['total_segments']}")
+            # Test 1: English captions
+            captions = await service.get_captions(url, languages=['en'])
+            if captions["success"]:
+                print(f"   ✓ English captions found ({captions['total_segments']} segments)")
+                print(f"     Language: {captions['language']} ({captions['language_name']})")
+                print(f"     Auto-generated: {captions['is_auto_generated']}")
 
-           
-            text = captions_result.get('text', '')
-            if text:
-                print(f"Text preview: {text[:200]}...")
-        else:
-            print(f"Failed to get captions: {captions_result['error']}")
+                # Show ALL captions (full length)
+                if captions["subtitles"]:
+                    print("\n     FULL CAPTIONS:")
+                    print("     " + "="*50)
+                    for i, sub in enumerate(captions["subtitles"], 1):
+                        timestamp = f"[{sub['start']:.1f}s - {sub['start'] + sub['duration']:.1f}s]"
+                        print(f"     {i:3d}. {timestamp:20} {sub['text']}")
+                    print("     " + "="*50)
+            else:
+                print(f"   ✗ English captions failed: {captions['error']}")
 
-    except Exception as e:
-        print(f"Error: {e}")
+            # Test 2: Multiple language preference
+            captions_multi = await service.get_captions(url, languages=['es', 'fr', 'en'])
+            if captions_multi["success"]:
+                print(f"   ✓ Multi-language search found: {captions_multi['language']}")
+            else:
+                print(f"   ✗ Multi-language search failed: {captions_multi['error']}")
 
+            # Test 3: Translation (if captions exist)
+            if captions["success"]:
+                translated = await service.get_captions(url, languages=['en'], translate_to='es')
+                if translated["success"]:
+                    print(f"   ✓ Translation to Spanish successful")
+                    print(f"     Was translated: {translated['was_translated']}")
+                else:
+                    print(f"   ✗ Translation failed: {translated['error']}")
 
+            # Test 4: Different formats
+            if captions["success"]:
+                print("\n4. Testing different formats...")
+                for fmt in ['txt', 'srt', 'vtt']:
+                    formatted = await service.get_captions(url, languages=['en'], format_type=fmt)
+                    if formatted["success"]:
+                        print(f"   ✓ {fmt.upper()} format: {len(formatted['text'])} chars")
+                        print(f"     FULL {fmt.upper()} OUTPUT:")
+                        print("     " + "-"*40)
+                        # Print the full formatted text
+                        lines = formatted["text"].split('\n')
+                        for line in lines:
+                            print(f"     {line}")
+                        print("     " + "-"*40)
 
-async def get_video_transcript_only(url: str, assemblyai_api_key: str = None) -> str:
+        except Exception as e:
+            print(f"Error processing {url}: {e}")
 
-    service = YouTubeVideoService(assemblyai_api_key=assemblyai_api_key)
-
-    result = await service.get_captions(
-        url,
-        languages=['en'],
-        format_type='txt',
-        use_assemblyai_fallback=bool(assemblyai_api_key)
-    )
-
-    if result["success"]:
-        return result.get('text', '')
-    else:
-        raise Exception(f"Failed to get transcript: {result['error']}")
-
-
-async def download_captions_as_file(url: str, output_file: str, format_type: str = 'srt',
-                                    assemblyai_api_key: str = None):
-    """
-    Download captions and save to file
-    """
-    service = YouTubeVideoService(assemblyai_api_key=assemblyai_api_key)
-
-    result = await service.get_captions(
-        url,
-        languages=['en'],
-        format_type=format_type,
-        use_assemblyai_fallback=bool(assemblyai_api_key)
-    )
-
-    if result["success"]:
-        content = result.get('text', '')
-        with open(output_file, 'w', encoding='utf-8') as f:
-            f.write(content)
-        print(f"Captions saved to {output_file}")
-        return True
-    else:
-        print(f"Failed to download captions: {result['error']}")
-        return False
+    print(f"\n{'=' * 60}")
+    print("Testing complete!")
 
 
 if __name__ == "__main__":
- 
+    # Set up logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
     asyncio.run(main())
