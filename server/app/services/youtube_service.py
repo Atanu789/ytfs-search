@@ -9,7 +9,7 @@ import requests
 from pymongo import MongoClient
 from youtube_transcript_api import YouTubeTranscriptApi
 from youtube_transcript_api._errors import TranscriptsDisabled, NoTranscriptFound, VideoUnavailable
-from embedding_service import EmbeddingService
+from .embedding_service import EmbeddingService
 from aiolimiter import AsyncLimiter
 import os
 from datetime import datetime
