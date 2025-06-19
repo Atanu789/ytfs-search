@@ -10,9 +10,12 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@tailwindcss/vite": "^4.1.10",
+    "lucide-react": "^0.517.0",
     "path": "^0.12.7",
     "react": "^19.1.0",
-    "react-dom": "^19.1.0"
+    "react-dom": "^19.1.0",
+    "tailwindcss": "^4.1.10"
   },
   "devDependencies": {
     "@crxjs/vite-plugin": "^2.0.0",
