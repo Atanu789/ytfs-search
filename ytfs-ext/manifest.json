@@ -1,19 +1,12 @@
 {
+  "name": "video Navigation",
+  "version": "1.0",
   "manifest_version": 3,
-  "name": "Video Navigator",
-  "version": "1.0.0",
-  "description": "Chrome extension to navigate directly to specific parts of videos with timestamps and bookmarks.",
+  "action": {
+    "default_popup": "index.html"
+  },
   "permissions": [
-    "storage",
-    "tabs",
-    "activeTab"
-  ],
-  "host_permissions": [
-    "https://www.youtube.com/*",
-    "https://vimeo.com/*",
-    "https://www.twitch.tv/*",
-    "https://player.vimeo.com/*",
-    "https://*.amazonaws.com/*",
-    "https://*.cloudfront.net/*"
+    "activeTab",
+    "storage"
   ]
 }
